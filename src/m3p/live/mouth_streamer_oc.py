@@ -212,7 +212,12 @@ class FormantVowelClassifier:
         self.max_hz = int(max_hz)
 
     def classify_at(self, wav_buf: np.ndarray, t0_ms: int, center_ms: int) -> tuple[int, Optional[float], Optional[float]]:
-        """Return (mouth_id, f1, f2). mouth_id=0 if cannot estimate."""
+        """Return (mouth_id, f1, f2). mouth_id=0 if cannot estimate.
+
+        Phase18: causally clamp the formant window to available audio instead of
+        refusing when the future half of formant_window is not yet buffered.
+        Still real Parselmouth formant → KNN mouth (no mouth_closed fill).
+        """
         if parselmouth is None:
             return 0, None, None
 
@@ -223,7 +228,13 @@ class FormantVowelClassifier:
         start = int(round((start_ms - t0_ms) * self.sr / 1000.0))
         end = int(round((end_ms - t0_ms) * self.sr / 1000.0))
 
-        if start < 0 or end > wav_buf.size or end <= start:
+        # Causal clamp to buffered samples (frontier is past-heavy; interior
+        # frames still see a near-symmetric window once audio has advanced).
+        if start < 0:
+            start = 0
+        if end > wav_buf.size:
+            end = int(wav_buf.size)
+        if end <= start:
             return 0, None, None
 
         seg = wav_buf[start:end].astype(np.float32)
@@ -236,6 +247,7 @@ class FormantVowelClassifier:
             max_number_of_formants=5,
             maximum_formant=float(self.max_hz),
         )
+        # Use mid-segment time in the (possibly clamped) analysis window.
         t = snd.get_total_duration() / 2.0
         f1 = formant.get_value_at_time(1, t)
         f2 = formant.get_value_at_time(2, t)
@@ -279,6 +291,8 @@ class MouthStreamerOC:
             "vad_energy_thr": self.cfg.vad_energy_thr,
             "vad_min_speech_ms": self.cfg.vad_min_speech_ms,
             "vad_min_silence_ms": self.cfg.vad_min_silence_ms,
+            # Phase18: emit on step-complete; formant window is causally clamped.
+            "formant_causal_emit": True,
         }
 
         # STEP1用: energy.py で事前計算した VAD mask
@@ -367,16 +381,14 @@ class MouthStreamerOC:
         next_t_ms = next_k * self.cfg.step_ms
 
         while True:
-            # 通常は「1ステップ分の音が来たら」フレーム確定できるが、
-            # formant(Parselmouth) は中心±(formant_window/2) の“未来側”が必要。
+            # Phase18: emit as soon as one step of audio is present.
+            # Previously formant mode waited for center+(formant_window/2) of
+            # *future* samples (default +120ms), which produced a structural
+            # mouth lag of ~80ms vs PCM (until - mouth_cov). classify_at now
+            # causally clamps the analysis window so we keep real formant→KNN
+            # mouth shapes without blocking emit on unavailable future audio.
             seg_end_ms = next_t_ms + self.cfg.step_ms
-
             need_end_ms = seg_end_ms
-            if getattr(self.cfg, "vowel_mode", "rms") == "formant":
-                # center = next_t_ms + step/2
-                # need_end = center + formant_window/2
-                half = int(getattr(self.cfg, "formant_window_ms", 200) // 2)
-                need_end_ms = int(next_t_ms + (self.cfg.step_ms // 2) + half)
 
             if need_end_ms > end_ms:
                 break
