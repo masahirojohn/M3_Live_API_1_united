@@ -147,12 +147,21 @@ class EnergyVADStream:
                 self._run = 0
         return self._state
 
-    def ensure_steps(self, n_steps: int, audio_f: np.ndarray) -> None:
+    def ensure_steps(self, n_steps: int, audio_f: np.ndarray, buf_t0_ms: int = 0) -> None:
+        """Extend step_mask up to n_steps using audio relative to trimmed buffer origin.
+
+        Step index i is on the absolute session timeline (i * step_ms). After
+        max_buffer_s trim, audio_f starts at buf_t0_ms, so we must map absolute
+        step times into buffer-relative sample indices. Absolute indexing into
+        the trimmed buffer stalls VAD (vad_active stuck at 0) past ~max_buffer_s.
+        """
         while len(self.step_mask) < n_steps:
             i = len(self.step_mask)
-            s = i * self._step_samples
-            e = s + self._step_samples
-            if e > audio_f.size:
+            # Match MouthStreamerOC._emit_ready_frames seg slice (t0-relative).
+            seg_end_ms = (i + 1) * self.cfg.step_ms
+            e = int(round((seg_end_ms - int(buf_t0_ms)) * self.cfg.analysis_sr / 1000.0))
+            s = e - self._step_samples
+            if s < 0 or e > audio_f.size:
                 break
             seg = audio_f[s:e]
             rms = _frame_rms(seg)
@@ -404,7 +413,7 @@ class MouthStreamerOC:
             if self._pre_vad_mask is not None:
                 vad_active = int(self._pre_vad_mask[next_k]) if next_k < len(self._pre_vad_mask) else 0
             else:
-                self._vad.ensure_steps(next_k + 1, self._analysis_buf)
+                self._vad.ensure_steps(next_k + 1, self._analysis_buf, buf_t0_ms=self._t0_ms)
                 vad_active = int(self._vad.step_mask[next_k]) if len(self._vad.step_mask) > next_k else 0
 
             # STEP2: 母音推定は VAD=1 のフレームのみ
