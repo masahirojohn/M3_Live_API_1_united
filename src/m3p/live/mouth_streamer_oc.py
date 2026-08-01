@@ -486,12 +486,8 @@ class MouthStreamerOC:
                     "fallback_reason": fallback_reason,
                     "fallback_exception": (fallback_exception if fallback_reason == "exception_fallback_to_simple" else None),
                     "vad_active": int(vad_active),
-                    "cfg": {
-                        "rms_thr": float(self.cfg.rms_thr),
-                        "vad_energy_thr": float(self.cfg.vad_energy_thr),
-                        "vad_min_speech_ms": int(self.cfg.vad_min_speech_ms),
-                        "vad_min_silence_ms": int(self.cfg.vad_min_silence_ms),
-                    },
+                    # Phase24: do not duplicate session cfg on every frame
+                    # (lives in top-level meta.cfg / MouthOCConfig).
                 },
             }
             self._frames.append(fr)
@@ -505,7 +501,13 @@ class MouthStreamerOC:
             next_k = len(self._frames)
             next_t_ms = next_k * self.cfg.step_ms
 
-    def flush(self) -> None:
+    def flush(self, *, include_debug: bool = False) -> None:
+        """Write streamer JSON archive.
+
+        Hot-path flushes omit debug_frames and use compact JSON to avoid
+        O(N) RSS/allocator spikes on long turns (Phase 24). Finalize keeps
+        debug_frames for post-run self-gate / analysis.
+        """
         if self._pre_vad_meta is not None:
             vad_meta = {
                 "schema_version": "energy_vad.energy_py.strict2.v0.1",
@@ -542,7 +544,6 @@ class MouthStreamerOC:
             "version": "mouth_timeline.live.v0.3",
             "session_id": self.session_id,
             "step_ms": int(self.cfg.step_ms),
-           
             "frames": [
                 {
                     "t_ms": fr["t_ms"],
@@ -559,14 +560,18 @@ class MouthStreamerOC:
             ],
             "vad_meta": vad_meta,
             "meta": self._meta,
-            "debug_frames": self._frames,
         }
+        if include_debug:
+            out["debug_frames"] = self._frames
         with open(self.out_json, "w", encoding="utf-8") as f:
-            json.dump(out, f, ensure_ascii=False, indent=2)
+            if include_debug:
+                json.dump(out, f, ensure_ascii=False, indent=2)
+            else:
+                json.dump(out, f, ensure_ascii=False, separators=(",", ":"))
 
     def finalize(self) -> None:
         self._emit_ready_frames()
-        self.flush()
+        self.flush(include_debug=True)
 
 
 def run_pseudo_live_from_wav(wav_path: str, streamer: MouthStreamerOC, chunk_ms: int = 40) -> None:
